@@ -7,13 +7,12 @@ BATCH_SIZE = 50
 _GEMINI_DIM = 3072
 _FALLBACK_DIM = 768  # all-mpnet-base-v2
 
-from typing import TYPE_CHECKING, cast
-
-if TYPE_CHECKING:
-    from sentence_transformers import SentenceTransformer
-
-_active_model: "GoogleGenerativeAIEmbeddings | SentenceTransformer | None" = None
+_active_model = None
 _model_type: str | None = None  # "gemini" or "fallback"
+
+
+class RateLimitError(Exception):
+    pass
 
 
 # ── Model initialisation ───────────────────────────────────────────────────────
@@ -66,11 +65,10 @@ def get_embedding_dim() -> int:
 
 def _embed_batch(batch: list[str]) -> list[list[float]]:
     if _model_type == "gemini":
-        model = cast(GoogleGenerativeAIEmbeddings, _active_model)
         # Exponential backoff: 1 s → 2 s → 4 s → 8 s (4 attempts total)
         for attempt in range(4):
             try:
-                return model.embed_documents(batch)
+                return _active_model.embed_documents(batch)
             except Exception as e:
                 err = str(e).lower()
                 is_rate_limit = any(x in err for x in ("429", "rate", "quota", "resource_exhausted"))
@@ -84,10 +82,9 @@ def _embed_batch(batch: list[str]) -> list[list[float]]:
                 else:
                     logfire.error(f"Gemini embedding failed: {e}")
                     raise
-        raise RuntimeError("Gemini rate limit persisted after 4 attempts.")
+        raise RateLimitError("Gemini rate limit persisted after 4 attempts.")
     else:
-        model = cast("SentenceTransformer", _active_model)
-        return model.encode(batch, show_progress_bar=False).tolist()  # type: ignore
+        return _active_model.encode(batch, show_progress_bar=False).tolist()
 
 
 # ── Public API (same signatures as before) ─────────────────────────────────────
@@ -95,10 +92,8 @@ def _embed_batch(batch: list[str]) -> list[list[float]]:
 def embed_query(query: str) -> list[float]:
     _init()
     if _model_type == "gemini":
-        model = cast(GoogleGenerativeAIEmbeddings, _active_model)
-        return model.embed_query(query)
-    model = cast("SentenceTransformer", _active_model)
-    return model.encode([query])[0].tolist()  # type: ignore
+        return _active_model.embed_query(query)
+    return _active_model.encode([query])[0].tolist()
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
@@ -108,5 +103,4 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
         batch = texts[i : i + BATCH_SIZE]
         with logfire.span("Embed batch", model=_model_type, start=i, size=len(batch)):
             all_embeddings.extend(_embed_batch(batch))
-    return all_embeddings 
-    
+    return all_embeddings

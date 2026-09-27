@@ -25,13 +25,14 @@ from app.ingestion.chunking.splitter import chunk_text
 from app.ingestion.loaders.html import parse_html
 from app.ingestion.loaders.pdf import parse_pdf
 from app.ingestion.loaders.text import parse_text
-from app.services.retrieval.embedding import embed_texts, get_embedding_dim
+from app.services.retrieval.embeddings import embed_texts, get_embedding_dim, RateLimitError
+import time
 
 PROCESSED_DATA_DIR = "processed_data"
 
 # Initialize Qdrant Client
 qdrant_client = QdrantClient(
-    url=settings.QDRANT_URL,
+    url=settings.QDRANT_CLUSTER_ENDPOINT,
     api_key=settings.QDRANT_API_KEY,
 )
 
@@ -106,6 +107,8 @@ def process_file(file_path: str, filename: str, source_type: str):
                 )
                 logfire.info(f"Indexed {len(points)} points to Qdrant from {filename}.")
 
+        except RateLimitError:
+            raise
         except Exception as e:
             logfire.error(f"Failed to process {filename}: {e}")
 
@@ -115,11 +118,22 @@ def process_directory(dir_path: str, source_type: str):
     with logfire.span("Scanning Directory", path=dir_path, source=source_type):
         files = [f for f in os.listdir(dir_path) if os.path.isfile(os.path.join(dir_path, f))]
         logfire.info(f"Found {len(files)} files in {dir_path}.")
+        consecutive_rate_limits = 0
         for filename in files:
-            process_file(os.path.join(dir_path, filename), filename, source_type)
+            try:
+                process_file(os.path.join(dir_path, filename), filename, source_type)
+                consecutive_rate_limits = 0  # reset on success
+            except RateLimitError as e:
+                consecutive_rate_limits += 1
+                if consecutive_rate_limits >= 3:
+                    logfire.error("Circuit breaker tripped: Rate limit persisted across 3 files. Halting ingestion.")
+                    sys.exit(1)
+                wait_time = 60 * consecutive_rate_limits
+                logfire.warning(f"Rate limit exceeded. Pausing for {wait_time}s before next file (strike {consecutive_rate_limits}/3)...")
+                time.sleep(wait_time)
 
 
-def run_universal_ingestion(base_dir: str, explicit_source_type: str = None, wipe: bool = False):
+def run_universal_ingestion(base_dir: str, explicit_source_type: str | None = None, wipe: bool = False):
     """
     Scan base_dir, map sub-folders to source types, and ingest all documents.
     Pass --wipe to drop and recreate the Qdrant collection before ingestion.
